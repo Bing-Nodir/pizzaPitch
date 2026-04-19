@@ -185,6 +185,7 @@ class OrderProcess(StatesGroup):
     choosing_dishes = State()
     delivery_type = State()
     get_location = State()
+    manual_delivery_branch = State()
     pickup_branch = State()
     payment_type = State()
     order_note = State()
@@ -210,6 +211,7 @@ def checkout_reset_data() -> dict:
         "delivery_mode": None,
         "branch": None,
         "address_text": None,
+        "manual_address_text": None,
         "saved_address_id": None,
         "payment_type": None,
         "note": None,
@@ -398,6 +400,7 @@ def build_delivery_type_keyboard() -> types.ReplyKeyboardMarkup:
 def build_delivery_location_keyboard() -> types.ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
     builder.row(types.KeyboardButton(text=SEND_LOCATION_BUTTON, request_location=True))
+    builder.row(types.KeyboardButton(text="✍️ Manzilni yozish"))
     builder.row(types.KeyboardButton(text=BACK_BUTTON))
     return builder.as_markup(resize_keyboard=True)
 
@@ -446,7 +449,7 @@ def build_saved_addresses_text(addresses: list[dict]) -> str:
     for address in addresses:
         lines.append(f"• {address['title']} — {escape(address['branch_name'])}")
     lines.append("")
-    lines.append("Yangi manzil qo'shish uchun lokatsiya yuborish tugmasini ham ishlatishingiz mumkin.")
+    lines.append("Yangi manzil qo'shish uchun lokatsiya yuborish tugmasidan foydalaning yoki manzilni yozib yuboring.")
     return "\n".join(lines)
 
 
@@ -773,13 +776,13 @@ async def prompt_delivery_location_options(message: types.Message, user_id: int)
             reply_markup=build_saved_addresses_markup(saved_addresses),
         )
         await message.answer(
-            "Yoki yangi manzil uchun Telegram lokatsiyasini yuboring.",
+            "Yoki yangi manzil uchun Telegram lokatsiyasini yuboring yoki manzilni matn ko'rinishida yozing.",
             reply_markup=build_delivery_location_keyboard(),
         )
         return
 
     await message.answer(
-        "Saqlangan manzillar hozircha yo'q.\nYangi manzil qo'shish uchun lokatsiya yuboring.",
+        "Saqlangan manzillar hozircha yo'q.\nYangi manzil qo'shish uchun lokatsiya yuboring yoki manzilni yozib yuboring.",
         reply_markup=build_delivery_location_keyboard(),
     )
 
@@ -1078,7 +1081,7 @@ async def saved_address_callback(call: types.CallbackQuery, state: FSMContext):
         )
         await state.set_state(OrderProcess.get_location)
         await callback_message.answer(
-            "Yangi manzil qo'shish uchun Telegram lokatsiyasini yuboring.",
+            "Yangi manzil qo'shish uchun Telegram lokatsiyasini yuboring yoki manzilni yozib yuboring.",
             reply_markup=build_delivery_location_keyboard(),
         )
         await call.answer()
@@ -1412,8 +1415,74 @@ async def handle_location_fallback(message: types.Message, state: FSMContext):
         await state.set_state(OrderProcess.delivery_type)
         return
 
-    await message.answer("Iltimos, manzilni qo'lda yozmang.")
-    await prompt_delivery_location_options(message, require_user_id(message.from_user))
+    message_text = (message.text or "").strip()
+    if message_text == "✍️ Manzilni yozish":
+        await message.answer(
+            "Marhamat, to'liq manzilingizni yozib yuboring.\n"
+            "Masalan: Chilonzor 19-kvartal, 12-uy, 45-xonadon.",
+            reply_markup=build_delivery_location_keyboard(),
+        )
+        return
+
+    if message_text == SEND_LOCATION_BUTTON:
+        await message.answer(
+            "Telegram lokatsiyani avtomatik yubormadi.\n"
+            "Lokatsiya ruxsatini yoqing yoki manzilni matn ko'rinishida yuboring.",
+            reply_markup=build_delivery_location_keyboard(),
+        )
+        return
+
+    if not message_text:
+        await message.answer(
+            "Lokatsiya yuboring yoki manzilni yozib yuboring.",
+            reply_markup=build_delivery_location_keyboard(),
+        )
+        return
+
+    await state.update_data(manual_address_text=message_text, saved_address_id=None, lat=None, lon=None)
+    await message.answer(
+        f"📍 Manzil qabul qilindi: <b>{escape(message_text)}</b>\n"
+        "Endi qaysi filialdan yetkazib berishni tanlang:",
+        reply_markup=build_pickup_branch_keyboard(),
+    )
+    await state.set_state(OrderProcess.manual_delivery_branch)
+
+
+@dp.message(OrderProcess.manual_delivery_branch)
+async def manual_delivery_branch(message: types.Message, state: FSMContext):
+    if message.text == BACK_BUTTON:
+        await state.set_state(OrderProcess.get_location)
+        await prompt_delivery_location_options(message, require_user_id(message.from_user))
+        return
+
+    branch = BRANCH_BY_LABEL.get(message.text)
+    if not branch:
+        await message.answer("Iltimos, filialni pastdagi tugmalardan tanlang.")
+        return
+
+    data = await state.get_data()
+    manual_address_text = (data.get("manual_address_text") or "").strip()
+    if not manual_address_text:
+        await state.set_state(OrderProcess.get_location)
+        await prompt_delivery_location_options(message, require_user_id(message.from_user))
+        return
+
+    await state.update_data(
+        delivery_mode="delivery",
+        branch=branch["name"],
+        address_text=manual_address_text,
+        delivery_fee=DELIVERY_FEE,
+        lat=None,
+        lon=None,
+        saved_address_id=None,
+    )
+    await message.answer(
+        f"🏬 Filial: <b>{branch['name']}</b>\n"
+        f"📍 Manzil: <b>{escape(manual_address_text)}</b>\n"
+        "Endi to'lov turini tanlang:",
+        reply_markup=build_payment_keyboard(),
+    )
+    await state.set_state(OrderProcess.payment_type)
 
 
 @dp.message(OrderProcess.pickup_branch)
@@ -1456,6 +1525,14 @@ async def process_payment(message: types.Message, state: FSMContext):
                 reply_markup=build_pickup_branch_keyboard(),
             )
             await state.set_state(OrderProcess.pickup_branch)
+            return
+
+        if data.get("manual_address_text") and not data.get("lat") and not data.get("lon"):
+            await message.answer(
+                "Filialni qayta tanlang.",
+                reply_markup=build_pickup_branch_keyboard(),
+            )
+            await state.set_state(OrderProcess.manual_delivery_branch)
             return
 
         await state.set_state(OrderProcess.get_location)
